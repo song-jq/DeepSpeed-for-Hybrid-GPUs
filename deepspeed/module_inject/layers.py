@@ -7,6 +7,7 @@ import torch
 from deepspeed import comm as dist
 from torch import nn
 from torch.nn import functional as F
+import time
 
 from torch.nn.parameter import Parameter
 from deepspeed.accelerator import get_accelerator
@@ -14,16 +15,29 @@ from deepspeed.accelerator import get_accelerator
 
 class LinearAllreduce(nn.Module):
 
-    def __init__(self, weight, bias=None, mp_group=None):
+    def __init__(self, hook, weight, bias=None, mp_group=None):
         super(LinearAllreduce, self).__init__()
         self.weight = weight
         self.bias = bias
         self.mp_group = mp_group
 
+        # self.total_time = 0
+        self.hook = hook
+
     def forward(self, input):
+        # start = time.perf_counter()
         output = torch.matmul(input, self.weight.transpose(-1, -2))
-        if self.mp_group is not None:
-            dist.all_reduce(output, group=self.mp_group)
+        # end = time.perf_counter()
+        # self.hook((end-start)*1e3)
+
+        # if self.mp_group is not None:
+        #     # start = time.perf_counter()
+        #     dist.all_reduce(output, group=self.mp_group, async_op=False)
+            
+            # end = time.perf_counter()
+            # self.hook((end-start)*1e3)
+            # self.total_time += (end-start)*1e3
+            # print(f"allreduce time: {self.total_time} ms")
         if self.bias is not None:
             output += self.bias
         return output
@@ -31,7 +45,7 @@ class LinearAllreduce(nn.Module):
 
 class LinearLayer(nn.Module):
 
-    def __init__(self, weight_shape=None, dtype=torch.half, weight=None, bias=None):
+    def __init__(self, hook, weight_shape=None, dtype=torch.half, weight=None, bias=None):
         super(LinearLayer, self).__init__()
         if weight is not None:
             self.weight = weight
@@ -45,9 +59,13 @@ class LinearLayer(nn.Module):
                             dtype=dtype,
                             device=get_accelerator().current_device_name())) \
                 if bias is not None else None
+        self.hook = hook
 
     def forward(self, input):
+        # start = time.perf_counter()
         output = torch.matmul(input, self.weight.transpose(-1, -2))
+        # end = time.perf_counter()
+        # self.hook((end-start)*1e3)
         if self.bias is not None:
             output += self.bias
         return output

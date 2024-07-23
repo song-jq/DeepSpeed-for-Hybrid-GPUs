@@ -1626,7 +1626,6 @@ class DeepSpeedEngine(Module):
                 GLOBAL_RANK: self.global_rank,
                 DATA_SAMPLING_NUM_WORKERS: self.data_sampling_config()[DATA_SAMPLING_NUM_WORKERS]
             }
-
         return DeepSpeedDataLoader(dataset=dataset,
                                    batch_size=batch_size,
                                    pin_memory=pin_memory,

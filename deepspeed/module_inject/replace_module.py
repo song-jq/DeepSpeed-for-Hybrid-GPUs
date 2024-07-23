@@ -7,6 +7,7 @@ import os
 from typing import Optional
 import torch
 import tqdm
+import math
 import deepspeed
 import deepspeed.ops.transformer as transformer_inference
 from deepspeed.ops.transformer.inference.diffusers_attention import DeepSpeedDiffusersAttention
@@ -27,6 +28,7 @@ from .utils import policy_to_ds_container
 
 import gc
 
+total_time = []
 
 class ReplaceWithTensorSlicing:
 
@@ -185,7 +187,6 @@ def _module_match(module):
 
 
 def generic_injection(module, fp16=False, bf16=False, enable_cuda_graph=True):
-
     def replace_attn(child, policy):
         policy_attn = policy.attention(child)
         if policy_attn is None:
@@ -230,8 +231,10 @@ def generic_injection(module, fp16=False, bf16=False, enable_cuda_graph=True):
         return DeepSpeedDiffusersTransformerBlock(child, config)
 
     if isinstance(module, torch.nn.Module):
+        # print("generic_injection pass")
         pass
     else:
+        # print("generic_injection")
         if fp16 is False and bf16 is False:
             raise ValueError("Generic injection only supported with FP16 or BF16")
 
@@ -279,6 +282,28 @@ def generic_injection(module, fp16=False, bf16=False, enable_cuda_graph=True):
 
 container_g = None
 
+name2calculity = {}
+
+def generate_tp_proportion(config):
+    gpu_count = torch.cuda.device_count()
+    memory_optimization = config.memory_optimization
+    total_memory = []
+    calculity = []
+    tp_proportion = []
+    for i in range(gpu_count):
+        props = torch.cuda.get_device_properties(i)
+        if memory_optimization == True:
+            total_memory.append(props.total_memory)
+        else:
+            name = props.name
+            calculity.append(name2calculity[name])
+    for i in range(gpu_count):
+        if memory_optimization == True:
+            tp_proportion.append(total_memory[i]/sum(total_memory))
+        else:
+            tp_proportion.append(calculity[i]/sum(calculity))
+    return tp_proportion
+
 
 def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, model_config):
     """ Replace bert-style transformer layers with DeepSpeed's transformer layer
@@ -306,8 +331,9 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
 
     mp_replace = ReplaceWithTensorSlicing(mp_group=config.tensor_parallel.tp_group,
                                           mp_size=config.tensor_parallel.tp_size)  #, out_dim=0, in_dim=1)
-
+    # print(f'mp_replace:" {mp_replace}')
     def replace_with_policy(child, policy_cls, triangular_masking, inference=False, layer_id=0):
+        print("replace with policy")
         policy = policy_cls(child, inference=inference)
         if not policy.cuda_graph_supported:
             # policy says cuda graph is not supported raise an error if set
@@ -365,21 +391,67 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         return _container.module
 
     def replace_wo_policy(module, all_reduce_linears, prefix="", state_dict=None):
+        print("replace without policy")
+        print(f"all_reduce_linears: {all_reduce_linears}")  # ('output.dense',)
         mp_size = config.tensor_parallel.tp_size
         mp_group = config.tensor_parallel.tp_group
+
+        rank_division = mp_size / 2
+        
+        tp_proportion = config.tp_proportion
+        # if tp_proportion == ():
+        #     tp_proportion = generate_tp_proportion(config)
+        #     for i in range(len(tp_proportion)):
+        #         tp_proportion[i] = math.ceil(tp_proportion[i] * origin_slice)
+        
+        big_slice = tp_proportion[0]
+        small_slice = tp_proportion[1]
+        # origin_slice = (big_slice + small_slice) / 2
+
+        origin_slice = 4
+        # big_slice = 4
+        # small_slice = 4
+
+        # hook
+        def addTime_hook(t:int):
+            global total_time
+            total_time.append(t)
+            # if rank == 0 or rank == 2:
+            print(f"rank:{rank}, total_time: {sum(total_time[3:])/30} ms")
 
         def _replace(child, name, conv_linear_layer):
             if getattr(child, "replaced", False) == True:
                 return
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            # print(f"rank: {rank}")
             mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group)
             weight_shape = child.weight.shape
-            if name in all_reduce_linears:
-                new_weight = torch.empty((
-                    weight_shape[1] if conv_linear_layer else weight_shape[0],
-                    (weight_shape[0] if conv_linear_layer else weight_shape[1]) // mp_size,
-                ),
-                                         device=child.weight.device,
-                                         dtype=child.weight.dtype)
+            # print(f"child: {child}")
+            # print(f"name: {name}")
+            # print(f"conv_linear_layer: {conv_linear_layer}") #false
+            if name in all_reduce_linears:  #both
+                if rank == 0:
+                    print(f"name: {name} in all_reduce_linears, weight shape: {weight_shape}")
+                # ('output.dense',)
+                # my change 1
+                if rank < rank_division:
+                    new_weight = torch.empty((
+                        weight_shape[1] if conv_linear_layer else weight_shape[0],
+                        (weight_shape[0] if conv_linear_layer else weight_shape[1]) // mp_size * tp_proportion[i] // origin_slice,
+                    ),
+                                             device=child.weight.device,
+                                             dtype=child.weight.dtype)
+                else:
+                    new_weight = torch.empty((
+                        weight_shape[1] if conv_linear_layer else weight_shape[0],
+                        (weight_shape[0] if conv_linear_layer else weight_shape[1]) // mp_size * small_slice // origin_slice,
+                    ),
+                                             device=child.weight.device,
+                                             dtype=child.weight.dtype)
+                # if rank == 0 or rank == 2:
+                #     print(f"original_weight: {weight_shape},new_weight: {new_weight.shape}, rank:{rank}")
+
                 if conv_linear_layer:
                     child.weight.data = child.weight.data.transpose(-1, -2).contiguous()
                 data = mp_replace.copy(new_weight, child.weight.data)
@@ -387,81 +459,160 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                 if child.bias is not None:
                     new_bias.data.copy_(child.bias.data)
                 setattr(child, "replaced", True)
-                return LinearAllreduce(data, child.bias if child.bias is None else \
+                
+
+                return LinearAllreduce(addTime_hook, data, child.bias if child.bias is None else \
                             torch.nn.parameter.Parameter(new_bias.to(get_accelerator().current_device_name())), mp_group)
             else:
-                new_weight = torch.empty((
-                    (weight_shape[1] if conv_linear_layer else weight_shape[0]) // mp_size,
-                    weight_shape[0] // mp_size if conv_linear_layer else weight_shape[1],
-                ),
-                                         device=child.weight.device,
-                                         dtype=child.weight.dtype)
+                # if rank == 0:
+                #     print(f"name: {name} not in all_reduce_linears, weight shape: {weight_shape}")
+                # my change 2
+                if rank < rank_division:
+                    new_weight = torch.empty((
+                        (weight_shape[1] if conv_linear_layer else weight_shape[0]) // mp_size * big_slice // origin_slice,
+                        weight_shape[0] // mp_size if conv_linear_layer else weight_shape[1],
+                    ),
+                                             device=child.weight.device,
+                                             dtype=child.weight.dtype)
+                else:
+                    new_weight = torch.empty((
+                        (weight_shape[1] if conv_linear_layer else weight_shape[0]) // mp_size * small_slice // origin_slice,
+                        weight_shape[0] // mp_size if conv_linear_layer else weight_shape[1],
+                    ),
+                                             device=child.weight.device,
+                                             dtype=child.weight.dtype)
+                # if rank == 0 or rank == 2:
+                #     print(f"original_weight: {weight_shape},new_weight: {new_weight.shape}, rank:{rank}")
+
                 if conv_linear_layer:
                     child.weight.data = child.weight.data.transpose(-1, -2).contiguous()
                 data = mp_replace.copy(new_weight, child.weight.data)
+                # my change 3
+                if rank < rank_division:
+                    new_bias = torch.empty((weight_shape[0] // mp_size * big_slice // origin_slice),
+                                           device=child.weight.device,
+                                           dtype=child.weight.dtype)
+                else:
+                    new_bias = torch.empty((weight_shape[0] // mp_size * small_slice // origin_slice),
+                                           device=child.weight.device,
+                                           dtype=child.weight.dtype)
+                # if rank == 0 or rank == 2:
+                #     print(f"new_bias: {new_bias.shape}, rank:{rank}")
 
-                new_bias = torch.empty((weight_shape[0] // mp_size),
-                                       device=child.weight.device,
-                                       dtype=child.weight.dtype)
                 bias_data = None if child.bias is None else mp_replace.copy(new_bias, child.bias.data).to(
                     get_accelerator().current_device_name())
                 setattr(child, "replaced", True)
-                return LinearLayer(weight=data.to(get_accelerator().current_device_name()), bias=bias_data)
+                return LinearLayer(addTime_hook, weight=data.to(get_accelerator().current_device_name()), bias=bias_data)
 
         def _slice_embedding(child, name, conv_linear_layer):
+            print("slice embedding")
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
             if getattr(child, "replaced", False) == True:
                 return
             mp_replace = ReplaceWithTensorSlicing(mp_group=mp_group)
-            new_weight = torch.empty((child.weight.shape[0], child.weight.shape[1] // mp_size),
-                                     device=child.weight.device,
-                                     dtype=child.weight.dtype)
+            if rank < rank_division:
+                new_weight = torch.empty((child.weight.shape[0], child.weight.shape[1] // mp_size * big_slice // origin_slice),
+                                        device=child.weight.device,
+                                        dtype=child.weight.dtype)
+            else:
+                new_weight = torch.empty((child.weight.shape[0], child.weight.shape[1] // mp_size * small_slice // origin_slice),
+                                        device=child.weight.device,
+                                        dtype=child.weight.dtype)
             data = mp_replace.copy(new_weight,
                                    child.weight.ds_tensor.data if hasattr(child.weight, 'ds_tensor') else \
                                    child.weight.data)
-            new_embedding = nn.Embedding(child.weight.shape[0], child.weight.shape[1] // mp_size)
+            if rank < rank_division:
+                new_embedding = nn.Embedding(child.weight.shape[0], child.weight.shape[1] // mp_size * big_slice // origin_slice)
+            else:
+                new_embedding = nn.Embedding(child.weight.shape[0], child.weight.shape[1] // mp_size * small_slice // origin_slice)
             new_embedding.weight.data.copy_(data)
             setattr(child, "replaced", True)
             return new_embedding
 
         def update_mp_params(child):
+            # print("update_mp_params")
+            rank = dist.get_rank() if dist.is_initialized() else 0
             if getattr(child, "replaced", False) == True:
                 return
+            # my change 4
             if hasattr(child, 'n_heads'):
-                assert child.n_heads % mp_size == 0, "n_heads ({}) must be divisible by mp_size ({})".format(
+                assert child.n_heads % (mp_size) == 0, "n_heads ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.n_heads, mp_size)
-                child.n_heads = child.n_heads // mp_size
+                if rank == 0:
+                    print(f"n_heads: {child.n_heads}") 
+                if rank < rank_division:
+                    child.n_heads = child.n_heads // mp_size * big_slice // origin_slice
+                else:
+                    child.n_heads = child.n_heads // mp_size * small_slice // origin_slice
             if hasattr(child, 'inner_dim'):
-                assert child.inner_dim % mp_size == 0, "inner_dim ({}) must be divisible by mp_size ({})".format(
+                assert child.inner_dim % (mp_size) == 0, "inner_dim ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.inner_dim, mp_size)
-                child.inner_dim = child.inner_dim // mp_size
+                if rank == 0:
+                    print(f"inner_dim: {child.inner_dim}") 
+                if rank < rank_division:
+                    child.inner_dim = child.inner_dim // mp_size * big_slice // origin_slice
+                else:
+                    child.inner_dim = child.inner_dim // mp_size * small_slice // origin_slice
             if hasattr(child, 'num_heads'):
-                assert child.num_heads % mp_size == 0, "num_heads ({}) must be divisible by mp_size ({})".format(
+                assert child.num_heads % (mp_size) == 0, "num_heads ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.num_heads, mp_size)
-                child.num_heads = child.num_heads // mp_size
+                if rank == 0:
+                    print(f"num_heads: {child.num_heads}")     
+                if rank < rank_division:
+                    child.num_heads = child.num_heads // mp_size * big_slice // origin_slice
+                else:
+                    child.num_heads = child.num_heads // mp_size * small_slice // origin_slice
             if hasattr(child, 'num_attention_heads'):
-                assert child.num_attention_heads % mp_size == 0, "num_attention_heads ({}) must be divisible by mp_size ({})".format(
+                assert child.num_attention_heads % (mp_size) == 0, "num_attention_heads ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.num_attention_heads, mp_size)
-                child.num_attention_heads = child.num_attention_heads // mp_size
+                if rank == 0:
+                    print(f"num_attention_heads: {child.num_attention_heads}")                    
+                if rank < rank_division:
+                    child.num_attention_heads = child.num_attention_heads // mp_size * big_slice // origin_slice
+                else:
+                    child.num_attention_heads = child.num_attention_heads // mp_size * small_slice // origin_slice
             if hasattr(child, 'num_attn_heads'):
-                assert child.num_attn_heads % mp_size == 0, "num_attn_heads ({}) must be divisible by mp_size ({})".format(
+                assert child.num_attn_heads % (mp_size) == 0, "num_attn_heads ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.num_attn_heads, mp_size)
-                child.num_attn_heads = child.num_attn_heads // mp_size
+                if rank == 0:
+                    print(f"num_attn_heads: {child.num_attn_heads}") 
+                if rank < rank_division:
+                    child.num_attn_heads = child.num_attn_heads // mp_size * big_slice // origin_slice
+                else:
+                    child.num_attn_heads = child.num_attn_heads // mp_size * small_slice // origin_slice
             if hasattr(child, 'all_head_size'):
-                assert child.all_head_size % mp_size == 0, "all_head_size ({}) must be divisible by mp_size ({})".format(
+                assert child.all_head_size % (mp_size) == 0, "all_head_size ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.all_head_size, mp_size)
-                child.all_head_size = child.all_head_size // mp_size
+                if rank == 0:
+                    print(f"all_head_size: {child.all_head_size}") 
+                if rank < rank_division:
+                    child.all_head_size = child.all_head_size // mp_size * big_slice // origin_slice
+                else:
+                    child.all_head_size = child.all_head_size // mp_size * small_slice // origin_slice
             if hasattr(child, 'embed_dim'):
-                assert child.embed_dim % mp_size == 0, "embed_dim must ({}) be divisible by mp_size ({})".format(
+                assert child.embed_dim % (mp_size) == 0, "embed_dim must ({}) be divisible by (mp_size * 2) ({})".format(
                     child.embed_dim, mp_size)
-                child.embed_dim = child.embed_dim // mp_size
+                if rank == 0:
+                    print(f"embed_dim: {child.embed_dim}") 
+                if rank < rank_division:
+                    child.embed_dim = child.embed_dim // mp_size * big_slice // origin_slice
+                else:
+                    child.embed_dim = child.embed_dim // mp_size * small_slice // origin_slice
             if hasattr(child, 'hidden_size'):
-                assert child.hidden_size % mp_size == 0, "hidden_size ({}) must be divisible by mp_size ({})".format(
+                assert child.hidden_size % (mp_size) == 0, "hidden_size ({}) must be divisible by (mp_size * 2) ({})".format(
                     child.hidden_size, mp_size)
-                child.hidden_size = child.hidden_size // mp_size
+                if rank == 0:
+                    print(f"hidden_size: {child.hidden_size}") 
+                if rank < rank_division:
+                    child.hidden_size = child.hidden_size // mp_size * big_slice // origin_slice
+                else:
+                    child.hidden_size = child.hidden_size // mp_size * small_slice // origin_slice
+            
             setattr(child, "replaced", True)
 
         conv_linear_layer = False
-        if linear_layer_setting is not None:
+        if linear_layer_setting is not None: #always none
             linear_policies = {linear_layer_setting[0]: _replace}
             if len(linear_layer_setting) == 2:
                 linear_policies.update({linear_layer_setting[1]: _slice_embedding})
@@ -474,10 +625,14 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                 except ImportError:
                     linear_policies = {nn.Linear: _replace}
             else:
+                # print("linear_policies choose this")
                 linear_policies = {nn.Linear: _replace, nn.Embedding: _slice_embedding}
+        
+        # print(f"medium result: conv_linear_layer:{conv_linear_layer}, policy: {linear_policies}")
 
         def _replace_module(r_module, prev_name='', prev_class_name=''):
             for name, child in r_module.named_children():
+                # print(f"in replace_wo_policy: name: {name}, child: {child}")
                 if prev_class_name == "":
                     class_name = prev_name
                 elif prev_name == "":
@@ -493,9 +648,13 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                 if len(child._buffers) != 0 and state_dict != None:
                     load_buffer(child, state_dict, checking_key)
                 if child.__class__ in linear_policies:
+                    # print(f"in linear_policy: child name: {name}, shape: {child.weight.shape}")
+                    # call _replace
+                    # here update linear layer
                     setattr(r_module, name, linear_policies[child.__class__](child, prev_name + '.' + name,
                                                                              conv_linear_layer))
                 else:
+                    # here update other layers 
                     update_mp_params(child)
                     _replace_module(child, name, class_name)
             return r_module
@@ -517,6 +676,7 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
                                                  inference=True,
                                                  layer_id=layer_id)
             else:
+                #goes here 
                 new_module = replace_wo_policy(child, _policy, prefix=prefix, state_dict=state_dict)
 
         return new_module
@@ -534,6 +694,7 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
             pbar.update(1)
             gc.collect()
     else:
+        # print("replace module goes here")
         replaced_module = replace_module(model=model,
                                          orig_class=orig_layer_impl,
                                          replace_fn=replace_fn,
@@ -542,7 +703,10 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
     quantizer = GroupQuantizer(q_int8=quantize)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
+    # print(f"my_rank: {rank}")
+    #reading checkpoint, ignore
     if checkpoint_dict is not None and config.replace_with_kernel_inject:
+        # print("reading from checkpoint")
         assert container_g.ckpt_load_enabled, \
                f"Meta Tensor checkpoint loading not supported in {container_g.__class__.__name__} container"
         start_time = time.time()
@@ -613,6 +777,7 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         print(f"checkpoint loading time at rank {rank}: {time.time()-start_time} sec")
 
     if config.save_mp_checkpoint_path is not None:
+        # print("saving checkpoint")
         from collections import OrderedDict
         import json
         num_partitions = 8
@@ -758,12 +923,14 @@ def replace_module(model, orig_class, replace_fn, _replace_policy, checkpoint=No
     Returns:
         A modified ``model``.
     """
+    # print(f"replace_module: {orig_class} {_replace_policy}")
     sd = None
     if checkpoint != None:
         sd = torch.load(checkpoint, map_location='cpu')
     policy = {}
     if orig_class is not None:
         policy.update({orig_class: (replace_fn, _replace_policy)})
+        # print(f"replace_policy: {policy}")
     else:
         for plcy in replace_policies:
             # instantiate a throw-away policy in order to populate the _orig_layer_class
@@ -826,6 +993,10 @@ def _replace_module(model, policies, prefix='', layer_id=0, level_id=0, state_di
     Returns:
         Modified ``model``.
     """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        print(f"_replace_module: {model}")
+    # print(f"_replace_module policies: {policies}")
     try:
         import transformers
         OPTLearnedPositionalEmbedding = transformers.models.opt.modeling_opt.OPTLearnedPositionalEmbedding
@@ -833,7 +1004,12 @@ def _replace_module(model, policies, prefix='', layer_id=0, level_id=0, state_di
         OPTLearnedPositionalEmbedding = None
     load_layers = [nn.Linear, nn.Embedding, nn.LayerNorm, OPTLearnedPositionalEmbedding]
     for name, child in model.named_children():
+        # print(f"name and child: {name}, {child}")
         if child.__class__ in policies:
+            # print(f"child class in _replace_module: name: {name}")
+            # print(name)
+            # print(child.__class__)
+            # call replace_fn
             replaced_module = policies[child.__class__][0](child,
                                                            policies[child.__class__][-1],
                                                            layer_id,
@@ -846,6 +1022,7 @@ def _replace_module(model, policies, prefix='', layer_id=0, level_id=0, state_di
                 model.forward_funcs[model.fwd_map[name]] = replaced_module
             layer_id += 1
         else:
+            # print("child class not in policy")
             checking_key = prefix + name + '.'
             if child.__class__ in load_layers and state_dict != None:
                 if any(checking_key in item for item in state_dict):

@@ -77,6 +77,9 @@ def build_bloom_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype
     arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
     alibi = slopes[..., None] * arange_tensor
     if dist.is_initialized():
+        rank = dist.get_rank()
+        rank_division = 2
+        
         num_heads_per_rank = int(num_heads / dist.get_world_size())
         offset = dist.get_rank() * num_heads_per_rank
         alibi = alibi.view(batch_size, num_heads, 1, seq_length)
@@ -104,6 +107,8 @@ class InferenceEngine(Module):
 
         self.module = model
         self._config = config
+
+        # print(f"InferenceConfig: {config}")
 
         self._get_model_config_generate(config)  # keep for weird backward compatibility
 
@@ -172,6 +177,11 @@ class InferenceEngine(Module):
         else:
             moe = False
 
+        # if(moe):
+        #     print("!deepspeed engine has moe layers")
+        # else:
+        #     print("!deepspeed engine has no moe layers")
+            
         if moe and dist.get_world_size() > 1:
             self._create_ep_parallel_group(config.moe.moe_experts)
 
@@ -192,8 +202,9 @@ class InferenceEngine(Module):
                 self._apply_injection_policy(config)
             elif config.tensor_parallel.tp_size > 1:
                 # 3. Automatic Tensor Parallelism
+                # here 
                 parser_dict = AutoTP.tp_parser(model)
-                print("AutoTP: ", parser_dict)
+                # print("AutoTP: ", parser_dict)
                 for client_module, injection_policy in parser_dict:
                     if isinstance(injection_policy, str):
                         config.injection_policy_tuple = (injection_policy, )
@@ -240,6 +251,7 @@ class InferenceEngine(Module):
                 self.module.transformer.build_alibi_tensor = build_bloom_alibi_tensor
 
     def _pre_forward_hook(self, module, *inputs, **kwargs):
+        # print("_pre_forward_hook")
         if self.use_cuda_events:
             self.timers(INFERENCE_MODEL_TIMER).start()
         else:
@@ -247,6 +259,7 @@ class InferenceEngine(Module):
             self._start = time.time()
 
     def _post_forward_hook(self, module, input, output):
+        # print("_post_forward_hook")
         if self.use_cuda_events:
             self.timers(INFERENCE_MODEL_TIMER).stop()
             elapsed_time = self.timers(INFERENCE_MODEL_TIMER).elapsed(reset=True)
@@ -254,6 +267,7 @@ class InferenceEngine(Module):
             get_accelerator().synchronize()
             self._end = time.time()
             elapsed_time = (self._end - self._start) * 1e3  # convert seconds to ms
+        # modified
         self._model_times.append(elapsed_time)
 
     def _create_model_parallel_group(self, config):
@@ -265,6 +279,7 @@ class InferenceEngine(Module):
 
             ranks = [i for i in range(config.tensor_parallel.tp_size)]
             self.mp_group = dist.new_group(ranks)
+            print(f"tensor_parallel_group: {self.mp_group}")
             InferenceEngine.inference_mp_group = self.mp_group
         else:
             self.mp_group = InferenceEngine.inference_mp_group
@@ -415,7 +430,7 @@ class InferenceEngine(Module):
         checkpoint_dir = config.checkpoint
         checkpoint = SDLoaderFactory.get_sd_loader_json(checkpoint_dir,
                                                         self.checkpoint_engine) if checkpoint_dir is not None else None
-
+        # if not isinstance(self.module, torch.nn.Module)
         generic_injection(self.module,
                           fp16=(config.dtype == torch.half) or (config.dtype == torch.int8),
                           bf16=(config.dtype == torch.bfloat16),
@@ -423,6 +438,7 @@ class InferenceEngine(Module):
 
         if isinstance(self.module, torch.nn.Module):
             # config is our DeepSpeedInferenceConfig and self.config is the HF model config
+            # print("replace transformer layer")
             replace_transformer_layer(client_module, self.module, checkpoint, config, self.config)
 
     def _get_all_ckpt_names(self, checkpoints_path, tag):
@@ -590,6 +606,7 @@ class InferenceEngine(Module):
             return sub_module_cuda_graph
 
     def forward(self, *inputs, **kwargs):
+        # print("forward")
         """Execute forward propagation
 
         Arguments:
@@ -597,9 +614,14 @@ class InferenceEngine(Module):
             **kwargs: variable length keyword arguments
         """
         start = None
+        # print(f"forward: {self.model_profile_enabled}, {self._config.enable_cuda_graph}")
+        # cuda graph cannot be used in tp
         if self.model_profile_enabled and get_accelerator().device_name() == 'cuda' and self._config.enable_cuda_graph:
             get_accelerator().synchronize()
             start = time.time()
+        
+        # get_accelerator().synchronize()
+        # start = time.time()
 
         if get_accelerator().device_name() == 'cuda' and self._config.enable_cuda_graph and not self.local_cuda_graph:
             if self.cuda_graph_created:
@@ -608,7 +630,12 @@ class InferenceEngine(Module):
                 self._create_cuda_graph(*inputs, **kwargs)
                 outputs = self._graph_replay(*inputs, **kwargs)
         else:
+            # here
             outputs = self.module(*inputs, **kwargs)
+
+        # get_accelerator().synchronize()
+        # duration = (time.time() - start) * 1e3 
+        # self._model_times.append(duration)
 
         if self.model_profile_enabled and self._config.enable_cuda_graph:
             get_accelerator().synchronize()
@@ -618,6 +645,7 @@ class InferenceEngine(Module):
         return outputs
 
     def _generate(self, *inputs, **kwargs):
+        # print("_generate")
         # Reset KV-cache at the beginning of generate
         if hasattr(self.module, 'reset_cache'):
             self.module.reset_cache()

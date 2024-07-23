@@ -273,6 +273,17 @@ class DeepSpeedInferenceConfig(DeepSpeedConfigModel):
     moe_experts: list = Field([1], deprecated=True, new_param="moe.moe_experts")
     moe_type: MoETypeEnum = Field(MoETypeEnum.standard, deprecated=True, new_param="moe.type")
 
+    """
+    User-defined tensor parallelism division proportion. If empty, using auto division.
+    e.g. tp_proportion=(5, 3) represents 5/8 for GPU0 and 3/8 for GPU1.
+    """
+    tp_proportion: tuple = None
+
+    """
+    This argument show whether to optimize according to memory or computility
+    """
+    memory_optimization: bool = False
+
     @validator("moe")
     def moe_backward_compat(cls, field_value, values):
         if isinstance(field_value, bool):

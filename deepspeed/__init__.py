@@ -327,9 +327,11 @@ def init_inference(model, config=None, **kwargs):
         if config_dict[key] != kwargs[key]:
             raise ValueError(f"Conflicting argument '{key}' in 'config':{config_dict[key]} and kwargs:{kwargs[key]}")
     config_dict.update(kwargs)
+    print(f"config_dict: {config_dict}")
 
     ds_inference_config = DeepSpeedInferenceConfig(**config_dict)
-
+    print(f"ds_inference_config: {ds_inference_config}")
     engine = InferenceEngine(model, config=ds_inference_config)
+    # print(f"engine.module: {engine.module}")
 
     return engine

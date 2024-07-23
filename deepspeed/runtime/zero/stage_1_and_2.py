@@ -336,6 +336,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             # verify that data partition start locations are 4-byte aligned
             for partitioned_data in data_parallel_partitions:
+                # logger.info(f'dataptr {partitioned_data.data_ptr()}')
                 assert (partitioned_data.data_ptr() % (2 * self.nccl_start_alignment_factor) == 0)
 
             # A partition of the fp32 master weights that will be updated by this process.
@@ -1403,7 +1404,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # dp_id = dist.get_rank(group=self.real_dp_process_group[group_id])
 
         total_num_elements = tensor.numel()
-
         base_size = total_num_elements // dp
         remaining = total_num_elements % dp
 
@@ -1414,6 +1414,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 partition_size = partition_size + 1
             partitions.append(tensor.narrow(0, start, partition_size))
             start = start + partition_size
+
         return partitions
 
     def get_partition_info(self, tensor_list, partition_size, partition_id):
