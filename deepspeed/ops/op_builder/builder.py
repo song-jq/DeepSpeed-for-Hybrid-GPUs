@@ -446,7 +446,7 @@ class OpBuilder(ABC):
             # Ensure the op we're about to load was compiled with the same
             # torch/cuda versions we are currently using at runtime.
             self.validate_torch_version(torch_info)
-            if torch.cuda.is_available() and isinstance(self, CUDAOpBuilder):
+            if torch.cuda.is_available() and isinstance(self, CUDAOpBuilder):    #ignore-cuda
                 self.validate_torch_op_version(torch_info)
 
             return importlib.import_module(self.absolute_name())
@@ -536,9 +536,9 @@ class CUDAOpBuilder(OpBuilder):
         ccs = []
         if self.jit_mode:
             # Compile for underlying architectures since we know those at runtime
-            for i in range(torch.cuda.device_count()):
-                CC_MAJOR, CC_MINOR = torch.cuda.get_device_capability(i)
-                cc = f"{CC_MAJOR}.{CC_MINOR}"
+            for i in range(torch.cuda.device_count()):                       #ignore-cuda
+                CC_MAJOR, CC_MINOR = torch.cuda.get_device_capability(i)     #ignore-cuda
+                cc = f"{CC_MAJOR}.{CC_MINOR}"   
                 if cc not in ccs:
                     ccs.append(cc)
             ccs = sorted(ccs)

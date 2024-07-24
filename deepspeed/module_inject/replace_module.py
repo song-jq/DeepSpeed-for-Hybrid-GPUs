@@ -285,13 +285,13 @@ container_g = None
 name2calculity = {}
 
 def generate_tp_proportion(config):
-    gpu_count = torch.cuda.device_count()
+    gpu_count = torch.cuda.device_count()            #ignore-cuda
     memory_optimization = config.memory_optimization
     total_memory = []
     calculity = []
     tp_proportion = []
     for i in range(gpu_count):
-        props = torch.cuda.get_device_properties(i)
+        props = torch.cuda.get_device_properties(i)  #ignore-cuda
         if memory_optimization == True:
             total_memory.append(props.total_memory)
         else:

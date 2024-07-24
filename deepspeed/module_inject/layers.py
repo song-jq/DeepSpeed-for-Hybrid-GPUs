@@ -30,9 +30,9 @@ class LinearAllreduce(nn.Module):
         # end = time.perf_counter()
         # self.hook((end-start)*1e3)
 
-        # if self.mp_group is not None:
-        #     # start = time.perf_counter()
-        #     dist.all_reduce(output, group=self.mp_group, async_op=False)
+        if self.mp_group is not None:
+            # start = time.perf_counter()
+            dist.all_reduce(output, group=self.mp_group, async_op=False)
             
             # end = time.perf_counter()
             # self.hook((end-start)*1e3)
